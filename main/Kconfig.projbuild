@@ -1,0 +1,15 @@
+menu "Project Configuration"
+
+config SCL_PIN
+    int "SCL GPIO"
+    default 5
+    help
+        This GPIO is SCL pin for i2c.
+
+config SDA_PIN
+    int "SDA GPIO"
+        default 4
+        help
+            This GPIO is SDA pin for i2c.
+
+endmenu

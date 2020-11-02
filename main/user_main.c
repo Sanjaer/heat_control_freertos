@@ -41,6 +41,8 @@
 #include <esp_http_server.h>
 #include "driver/gpio.h"
 
+#include "sht3x.h"
+
 #define GPIO_OUTPUT_IO_1        5
 #define GPIO_OUTPUT_PIN_SEL     ((1ULL<<GPIO_OUTPUT_IO_1))
 #define MAIN_FORM              "<form action=\"/control\"> \
@@ -56,25 +58,37 @@
                                 <input type=\"submit\" value=\"Submit\"> \
                                 </form>"
 
+#define TON_CODE                (uint8_t)1
+#define TOFF_CODE               (uint8_t)2
+#define TEMP_CODE               (uint8_t)3
+
+
 static const char *TAG_MAIN = "main";
 static const char *TAG_WIFI = "wifi";
 static const char *TAG_SERVER = "server";
+static const char *TAG_TASK_READ = "ReadQ";
+static const char *TAG_TASK_WRITE = "WriteQ";
 static const char *SEMICOLON_ENCODE = "%3A";
 
 
 /* Global variables */
 static httpd_handle_t server = NULL;
+static xQueueHandle i2c_lecture_queue = NULL;
+static xQueueHandle web_lecture_queue = NULL;
+static uint8_t time_on_global[] = {0,0};
+static uint8_t time_off_global[] = {23,59};
+static uint8_t ref_temp_global;
 
 
 /* Task declarations */
-static void relay_task(void *arg);
+static void control_task(void *arg);
 
 
 /* Local functions declarations */
 esp_err_t gpio_setup(void);
 httpd_handle_t start_webserver(void);
 void stop_webserver(httpd_handle_t server);
-bool validate_value(char *data, int key);
+bool validate_value(char *data, uint8_t key);
 
 
 /* Handlers declarations */
@@ -99,15 +113,73 @@ httpd_uri_t control = {
 
 
 /* Task definitions */
-static void relay_task(void *arg){
+static void control_task(void *arg){
 
-    char cnt = 0;
+    struct SensorData *data_recvd = malloc(sizeof(struct SensorData));
+    uint8_t code_updated=0;
 
     for (;;) {
-        cnt = !cnt;
-        vTaskDelay(3000 / portTICK_RATE_MS);
-        gpio_set_level(GPIO_OUTPUT_IO_1, cnt);
+        memset(data_recvd, 0, sizeof(struct SensorData));
+
+        if (xQueueReceive(i2c_lecture_queue, data_recvd, portMAX_DELAY)) {
+            // ESP_LOGI(TAG_TASK_READ, "Temperature from queue: %f\n", data_recvd->temperature);
+            if (data_recvd->temperature < 25){
+                gpio_set_level(GPIO_OUTPUT_IO_1, 1);
+            } else {
+                gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+            }
+        }
+
+        if (xQueueReceive(web_lecture_queue, &code_updated, portMAX_DELAY)){
+            ESP_LOGI(TAG_TASK_READ, "Code updated: %d\n", code_updated);
+        }
+
+        vTaskDelay(2000 / portTICK_RATE_MS);
     }
+}
+
+/**
+ * @brief task to show use case of a queue publish sensor data
+ */
+static void i2c_task_example(void *arg)
+{
+    uint8_t sensor_data[DATA_MSG_SIZE];
+    struct SensorData *data_recvd = malloc(sizeof(struct SensorData));
+    static uint32_t count = 0;
+
+    vTaskDelay(100 / portTICK_RATE_MS);
+    
+    // Init i2c master
+    i2c_master_init();
+    
+    while (1) {
+
+        // Counter num of iterations, no practical use
+        count++;
+ 
+        // Set to zeroes all data variables
+        memset(sensor_data, 0, DATA_MSG_SIZE);
+        memset(data_recvd, 0, sizeof(struct SensorData));
+
+        // Single shot data acquisition mode, clock stretching
+        i2c_master_sht30_read(I2C_EXAMPLE_MASTER_NUM, SHT30_CMD_START_MSB, SHT30_CMD_START_LSB, sensor_data, DATA_MSG_SIZE);
+
+        // Convert raw data to true values
+        data_recvd->temperature = convert_raw_to_celsius(sensor_data);
+        data_recvd->humidity = convert_raw_to_humidity(sensor_data);
+
+        // Print values
+        // printf("count: %d\n", count);
+        // printf("temp=%f, hum=%f\n", data_recvd->temperature, data_recvd->humidity);
+
+        if (!xQueueSend(i2c_lecture_queue, data_recvd, portMAX_DELAY)){
+            ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
+        }
+
+        vTaskDelay(1000 / portTICK_RATE_MS);
+    }
+
+    i2c_driver_delete(I2C_EXAMPLE_MASTER_NUM);
 }
 
 
@@ -164,31 +236,74 @@ void stop_webserver(httpd_handle_t server){
 
 
 /* Extract, validate and resend if ok value to control task */
-bool validate_value(char *data, int key){
+bool validate_value(char *data, uint8_t key){
 
     bool result = false;
     char *piece;
 
     switch (key){
 
-        case 1:
+        case TON_CODE:
         // t_on
-        printf("Dis data starts: %s\n", data);
+        printf("Validating t_on\n");
         if ((data[2] == '%') && (piece = strstr(data, SEMICOLON_ENCODE)) != NULL){
             int hh_mm[2];
+            // Extract data from URL
             hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
-            printf("Dis HH: %d\n", hh_mm[0]);
             hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
+
+            // Temporary just for testing
+            if (hh_mm[0] < time_off_global[0]){
+                time_on_global[0] = hh_mm[0];
+                time_on_global[1] = hh_mm[1];
+                result = true;
+            } else if (hh_mm[0] == time_off_global[0] && hh_mm[1] < time_off_global[1]){
+                time_on_global[0] = hh_mm[0];
+                time_on_global[1] = hh_mm[1];
+                result = true;
+            } else {
+                result = false;
+            }
+            // TODO: ##ifdef for debugging
+            printf("Dis HH: %d\n", hh_mm[0]);
+            printf("Dis MM: %d\n", hh_mm[1]);
+
+        }
+        break;
+
+        case TOFF_CODE:
+        // t_off
+        printf("Validating t_off\n");
+        printf("Dis data starts: %s\n", data);
+        if ((data[2] == '%') && (piece = strstr(data, SEMICOLON_ENCODE)) != NULL){
+            uint8_t hh_mm[2];
+            hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
+            hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
+
+            // Temporary just for testing
+            if (hh_mm[0] > time_on_global[0]){
+                time_off_global[0] = hh_mm[0];
+                time_off_global[1] = hh_mm[1];
+                result = true;
+            } else if (hh_mm[0] == time_on_global[0] && hh_mm[1] > time_on_global[1]){
+                time_off_global[0] = hh_mm[0];
+                time_off_global[1] = hh_mm[1];
+                result = true;
+            } else {
+                result = false;
+            }
+            printf("Dis HH: %d\n", hh_mm[0]);
             printf("Dis MM: %d\n", hh_mm[1]);
         }
         break;
 
-        case 2:
-        // t_off
-        break;
-
-        case 3:
+        case TEMP_CODE:
         // temperature
+        printf("Validating temperature\n");
+        if (atoi(data) > 0){
+            ref_temp_global = atoi(data);
+            result = true;
+        }
         break;
 
         default:
@@ -223,27 +338,56 @@ esp_err_t control_get_handler(httpd_req_t *req)
      * extra byte for null termination */
     buf_len = httpd_req_get_url_query_len(req) + 1;
     if (buf_len > 1) {
+
         buf = malloc(buf_len);
+
         if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+
             ESP_LOGI(TAG_SERVER, "Found URL query => %s", buf);
             char param[32];
-            /* Get value of expected key from query string */
+
+            // Data received updates time on via query string
             if (httpd_query_key_value(buf, "t_on", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => t_on=%s", param);
-                validate_value(param, 1);
+                // Validate data from user
+                if(validate_value(param, TON_CODE)){
+                    // TODO: probably TBD with a task notification
+                    // if (xQueueSend(web_lecture_queue, (void *)TON_CODE, portMAX_DELAY) != pdPASS){
+                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
+                    // }
+                }
+
             }
+
+            // Data received updates time off via query string
             if (httpd_query_key_value(buf, "t_off", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => t_off=%s", param);
-                validate_value(param, 2);
+                if(validate_value(param, TOFF_CODE)){
+                    // TODO: probably TBD with a task notification
+                    // if (xQueueSend(web_lecture_queue, (void *)TOFF_CODE, portMAX_DELAY) != pdPASS){
+                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
+                    // }
+                }
+
             }
+            
+            // Data received updates reference temperature via query string
             if (httpd_query_key_value(buf, "temp", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => temp=%s", param);
-                validate_value(param, 3);
+                if(validate_value(param, TEMP_CODE)){
+                    // TODO: probably TBD with a task notification
+                    // if (xQueueSend(web_lecture_queue, (void *)TEMP_CODE, portMAX_DELAY) != pdPASS){
+                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
+                    // }
+                }
             }
         }
+
         free(buf);
+
     }
 
+    // TODO: Update to meaningful values
     /* Set some custom headers */
     httpd_resp_set_hdr(req, "Custom-Header-1", "Custom-Value-1");
 
@@ -253,6 +397,7 @@ esp_err_t control_get_handler(httpd_req_t *req)
     const char* resp_str = (const char*) req->user_ctx;
     httpd_resp_send(req, resp_str, strlen(resp_str));
     ESP_LOGI(TAG_SERVER, "Sent response");
+
     return ESP_OK;
 }
 
@@ -294,11 +439,18 @@ void app_main()
 
     server = start_webserver();
 
+    // Create queue to publish temperature sensor's data
+    // TODO: remove magic number 10
+    i2c_lecture_queue = xQueueCreate(10, sizeof(struct SensorData));
+    web_lecture_queue = xQueueCreate(10, sizeof(uint8_t));
+
     if (gpio_setup() != ESP_OK){
         ESP_LOGI(TAG_MAIN, "Error configuring GPIOs");
     } else {
         ESP_LOGI(TAG_MAIN, "Starting tasks");
         // Task to control the relay
-        xTaskCreate(relay_task, "relay_task", 1024, NULL, 10, NULL);
+        xTaskCreate(control_task, "control_task", 1024, NULL, 10, NULL);
+        // Task to control SHT30 sensor
+        xTaskCreate(i2c_task_example, "i2c_task_example", 2048, NULL, 10, NULL);
     }
 }
