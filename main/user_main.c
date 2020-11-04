@@ -48,15 +48,18 @@
 #define MAIN_FORM              "<form action=\"/control\"> \
                                 Time ON: <input type=\"text\" name=\"t_on\"> \
                                 <input type=\"submit\" value=\"Submit\"> \
-                                </form>" \
+                                </form>"\
                                 "<form action=\"/control\"> \
                                 Time OFF: <input type=\"text\" name=\"t_off\"> \
                                 <input type=\"submit\" value=\"Submit\"> \
-                                </form>" \
-                                "<form action=\"/control\"> \
-                                Temperature: <input type=\"text\" name=\"temp\"> \
-                                <input type=\"submit\" value=\"Submit\"> \
-                                </form>"
+                                </form>"\
+                                "<form action=\"/control\">\
+                                Temperature: <input type=\"text\" name=\"temp\">\
+                                <input type=\"submit\" value=\"Submit\">\
+                                </form>"\
+                                "<p>Time on: HO:MO</p>\
+                                <p>Time off: HF:MF</p>\
+                                <p>Temperature: TCC</p>"
 
 #define TON_CODE                (uint8_t)1
 #define TOFF_CODE               (uint8_t)2
@@ -77,7 +80,7 @@ static xQueueHandle i2c_lecture_queue = NULL;
 static xQueueHandle web_lecture_queue = NULL;
 static uint8_t time_on_global[] = {0,0};
 static uint8_t time_off_global[] = {23,59};
-static uint8_t ref_temp_global;
+static uint8_t ref_temp_global = 18;
 
 
 /* Task declarations */
@@ -102,14 +105,22 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
 
 
 /* URI declarations */
-httpd_uri_t control = {
+/* URI declarations */
+httpd_uri_t default_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = control_get_handler,
+    .user_ctx  = MAIN_FORM
+};
+
+httpd_uri_t control_uri = {
     .uri       = "/control",
     .method    = HTTP_GET,
     .handler   = control_get_handler,
-    /* Let's pass response string in user
-     * context to demonstrate it's usage */
     .user_ctx  = MAIN_FORM
 };
+
+
 
 
 /* Task definitions */
@@ -123,7 +134,7 @@ static void control_task(void *arg){
 
         if (xQueueReceive(i2c_lecture_queue, data_recvd, portMAX_DELAY)) {
             // ESP_LOGI(TAG_TASK_READ, "Temperature from queue: %f\n", data_recvd->temperature);
-            if (data_recvd->temperature < 25){
+            if (data_recvd->temperature < ref_temp_global){
                 gpio_set_level(GPIO_OUTPUT_IO_1, 1);
             } else {
                 gpio_set_level(GPIO_OUTPUT_IO_1, 0);
@@ -218,7 +229,8 @@ httpd_handle_t start_webserver(void){
     if (httpd_start(&server, &config) == ESP_OK) {
         // Set URI handlers
         ESP_LOGI(TAG_SERVER, "Registering URI handlers");
-        httpd_register_uri_handler(server, &control);
+        httpd_register_uri_handler(server, &control_uri);
+        httpd_register_uri_handler(server, &default_uri);
         return server;
     }
 
