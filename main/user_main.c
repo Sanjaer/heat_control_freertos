@@ -22,11 +22,13 @@
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <sys/param.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -37,6 +39,8 @@
 #include "protocol_examples_common.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_sleep.h"
+#include "lwip/apps/sntp.h"
 
 #include <esp_http_server.h>
 #include "driver/gpio.h"
@@ -50,15 +54,19 @@
 #define TON_CODE                (uint8_t)1
 #define TOFF_CODE               (uint8_t)2
 #define TEMP_CODE               (uint8_t)3
+#define DATA_FIELD_SIZE         2
 
-
+/* Tags for logs */
 static const char *TAG_MAIN = "main";
 static const char *TAG_WIFI = "wifi";
 static const char *TAG_SERVER = "server";
 static const char *TAG_TASK_READ = "ReadQ";
 static const char *TAG_TASK_WRITE = "WriteQ";
-static const char *SEMICOLON_ENCODE = "%3A";
+static const char *TAG_SNTP = "sntp";
+static const char *TAG_CTRL = "ctrl";
 
+/* Global consts */
+static const char *SEMICOLON_ENCODE = "%3A";
 
 /* Global variables */
 // Handles
@@ -97,14 +105,19 @@ static char  formated_html[] =   "<h2>Smart heat controller </h2>" \
 
 /* Task declarations */
 static void control_task(void *arg);
+static void i2c_task_sht30(void *arg);
+static void sntp_example_task(void *arg);
 
 
 /* Local functions declarations */
+static void sleep_seconds(const uint32_t deep_sleep_sec);
+bool is_time_set (void);
+static void initialize_sntp(void);
 esp_err_t gpio_setup(void);
 httpd_handle_t start_webserver(void);
 void stop_webserver(httpd_handle_t server);
 bool validate_value(char *data, uint8_t key);
-void initial_replacement(void);
+void initial_mapping(void);
 void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes);
 
 
@@ -178,10 +191,10 @@ static void control_task(void *arg){
 }
 
 /**
- * @brief task to show use case of a queue publish sensor data
+ * @brief task that inits i2c comm, reads info from SHT30 sensor and writes to queue
  */
-static void i2c_task_example(void *arg)
-{
+static void i2c_task_sht30(void *arg) {
+
     uint8_t sensor_data[DATA_MSG_SIZE];
     struct SensorData *data_recvd = malloc(sizeof(struct SensorData));
     static uint32_t count = 0;
@@ -221,8 +234,78 @@ static void i2c_task_example(void *arg)
     i2c_driver_delete(I2C_EXAMPLE_MASTER_NUM);
 }
 
+static void sntp_example_task(void *arg) {
+
+    char strftime_buf[64];
+    time_t now;
+    struct tm timeinfo;
+    const int retry_count = 10;
+
+    initialize_sntp();
+
+    // time() returns the time since 00:00:00 UTC, January 1, 1970 (Unix timestamp) in seconds. 
+    // If now is not a null pointer, the returned value is also stored in the object pointed to by second.
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+
+    for (;;){
+        // tm_year = The number of years since 1900
+        // update 'now' variable with current time
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+        ESP_LOGI(TAG_SNTP, "The current date/time in Madrid is: %s", strftime_buf);
+
+        vTaskDelay(60000 / portTICK_RATE_MS);
+    }
+
+}
+
 
 /* Local functions definitions */
+// Function that sends the ESP8266 to sleep for deep_sleep_sec seconds
+// TB Used or Removed
+static void sleep_seconds(const uint32_t deep_sleep_sec) {
+    
+    ESP_LOGI(TAG_CTRL, "Entering deep sleep for %d seconds", deep_sleep_sec);
+    esp_deep_sleep(1000000LL * deep_sleep_sec);
+
+}
+
+// Function that checks whether the time is set or not
+// TB Used or Removed
+bool is_time_set (void) {
+    bool result = false;
+    time_t now;
+    struct tm timeinfo;
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    // Is time set? If not, tm_year will be (1970 - 1900).
+    if (timeinfo.tm_year < (2020 - 1900)) {
+
+        printf("TIME --> %d:%d\n", timeinfo.tm_hour, timeinfo.tm_min);
+        ESP_LOGI(TAG_SNTP, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
+    } else{
+        ESP_LOGI(TAG_SNTP, "Time is already set.");
+        result = true;
+    }
+
+    return result;
+}
+
+// Function to initialize SNTP, to be called only once
+static void initialize_sntp(void) {
+
+    ESP_LOGI(TAG_SNTP, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+
+}
+
+// Function to configure GPIOs
 esp_err_t gpio_setup(void){
 
     esp_err_t result;
@@ -302,8 +385,8 @@ bool validate_value(char *data, uint8_t key){
                         time_on_global[0] = hh_mm[0];
                         time_on_global[1] = hh_mm[1];
                         // If it has been validated, update HTML
-                        replace_in_html(HO_pos_global, data, 2);
-                        replace_in_html(MO_pos_global, piece+3, 2);
+                        replace_in_html(HO_pos_global, data, DATA_FIELD_SIZE);
+                        replace_in_html(MO_pos_global, piece+3, DATA_FIELD_SIZE);
                         // Set as valid
                         result = true;
                     }
@@ -333,8 +416,8 @@ bool validate_value(char *data, uint8_t key){
                         time_off_global[0] = hh_mm[0];
                         time_off_global[1] = hh_mm[1];
                         // If it has been validated, update HTML
-                        replace_in_html(HF_pos_global, data, 2);
-                        replace_in_html(MF_pos_global, piece+3, 2);
+                        replace_in_html(HF_pos_global, data, DATA_FIELD_SIZE);
+                        replace_in_html(MF_pos_global, piece+3, DATA_FIELD_SIZE);
                         // Set as valid
                         result = true;
                     }
@@ -355,7 +438,7 @@ bool validate_value(char *data, uint8_t key){
             }
             // If it has been validated, update HTML
             if (result){
-                replace_in_html(TC_pos_global, data, 2);
+                replace_in_html(TC_pos_global, data, DATA_FIELD_SIZE);
             }
             break;
 
@@ -365,6 +448,27 @@ bool validate_value(char *data, uint8_t key){
     }
 
     return result;
+
+}
+
+void initial_mapping(){
+
+    HO_pos_global = strstr(formated_html, "HO");
+    MO_pos_global = strstr(formated_html, "MO");
+    HF_pos_global = strstr(formated_html, "HF");
+    MF_pos_global = strstr(formated_html, "MF");
+    TC_pos_global = strstr(formated_html, "TC");
+
+}
+
+void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes){
+
+    uint32_t i;
+
+    for (i = 0; i < num_of_bytes; i++){
+        printf("i:%d\n", i);
+        *(target + i) = *(insertion+i);
+    }
 
 }
 
@@ -480,28 +584,6 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-
-void initial_replacement(){
-
-    HO_pos_global = strstr(formated_html, "HO");
-    MO_pos_global = strstr(formated_html, "MO");
-    HF_pos_global = strstr(formated_html, "HF");
-    MF_pos_global = strstr(formated_html, "MF");
-    TC_pos_global = strstr(formated_html, "TC");
-
-}
-
-void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes){
-
-    uint32_t i;
-
-    for (i = 0; i < num_of_bytes; i++){
-        printf("i:%d\n", i);
-        *(target + i) = *(insertion+i);
-    }
-
-}
-
 /* Main */
 void app_main(){
     
@@ -509,13 +591,14 @@ void app_main(){
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-
     ESP_ERROR_CHECK(example_connect());
+
+    xTaskCreate(sntp_example_task, "sntp_example_task", 2048, NULL, 10, NULL);
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
 
-    initial_replacement();
+    initial_mapping();
 
     server = start_webserver();
 
@@ -531,6 +614,6 @@ void app_main(){
         // Task to control the relay
         xTaskCreate(control_task, "control_task", 1024, NULL, 10, NULL);
         // Task to control SHT30 sensor
-        xTaskCreate(i2c_task_example, "i2c_task_example", 2048, NULL, 10, NULL);
+        xTaskCreate(i2c_task_sht30, "i2c_task_sht30", 2048, NULL, 10, NULL);
     }
 }
