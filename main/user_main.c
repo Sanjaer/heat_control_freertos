@@ -45,21 +45,7 @@
 
 #define GPIO_OUTPUT_IO_1        5
 #define GPIO_OUTPUT_PIN_SEL     ((1ULL<<GPIO_OUTPUT_IO_1))
-#define MAIN_FORM              "<form action=\"/control\"> \
-                                Time ON: <input type=\"text\" name=\"t_on\"> \
-                                <input type=\"submit\" value=\"Submit\"> \
-                                </form>"\
-                                "<form action=\"/control\"> \
-                                Time OFF: <input type=\"text\" name=\"t_off\"> \
-                                <input type=\"submit\" value=\"Submit\"> \
-                                </form>"\
-                                "<form action=\"/control\">\
-                                Temperature: <input type=\"text\" name=\"temp\">\
-                                <input type=\"submit\" value=\"Submit\">\
-                                </form>"\
-                                "<p>Time on: HO:MO</p>\
-                                <p>Time off: HF:MF</p>\
-                                <p>Temperature: TCC</p>"
+
 
 #define TON_CODE                (uint8_t)1
 #define TOFF_CODE               (uint8_t)2
@@ -75,12 +61,38 @@ static const char *SEMICOLON_ENCODE = "%3A";
 
 
 /* Global variables */
+// Handles
 static httpd_handle_t server = NULL;
 static xQueueHandle i2c_lecture_queue = NULL;
 static xQueueHandle web_lecture_queue = NULL;
+
+// Strings
+static char* HO_pos_global = 0;
+static char* MO_pos_global = 0;
+static char* HF_pos_global = 0;
+static char* MF_pos_global = 0;
+static char* TC_pos_global = 0;
+
 static uint8_t time_on_global[] = {0,0};
 static uint8_t time_off_global[] = {23,59};
 static uint8_t ref_temp_global = 18;
+static char  formated_html[] =   "<h2>Smart heat controller </h2>" \
+                                "<form action=\"/control\"> \
+                                Time ON: <input type=\"text\" name=\"t_on\"> \
+                                <input type=\"submit\" value=\"Submit\"> \
+                                </form>"\
+                                "<form action=\"/control\"> \
+                                Time OFF: <input type=\"text\" name=\"t_off\"> \
+                                <input type=\"submit\" value=\"Submit\"> \
+                                </form>"\
+                                "<form action=\"/control\">\
+                                Temperature: <input type=\"text\" name=\"temp\">\
+                                <input type=\"submit\" value=\"Submit\">\
+                                </form>"\
+                                "<p>Time on: HO:MO</p>\
+                                <p>Time off: HF:MF</p>\
+                                <p>Temperature: TCC</p>";
+
 
 
 /* Task declarations */
@@ -92,6 +104,8 @@ esp_err_t gpio_setup(void);
 httpd_handle_t start_webserver(void);
 void stop_webserver(httpd_handle_t server);
 bool validate_value(char *data, uint8_t key);
+void initial_replacement(void);
+void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes);
 
 
 /* Handlers declarations */
@@ -105,22 +119,19 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
 
 
 /* URI declarations */
-/* URI declarations */
 httpd_uri_t default_uri = {
     .uri       = "/",
     .method    = HTTP_GET,
     .handler   = control_get_handler,
-    .user_ctx  = MAIN_FORM
+    .user_ctx  = formated_html
 };
 
 httpd_uri_t control_uri = {
     .uri       = "/control",
     .method    = HTTP_GET,
     .handler   = control_get_handler,
-    .user_ctx  = MAIN_FORM
+    .user_ctx  = formated_html
 };
-
-
 
 
 /* Task definitions */
@@ -141,7 +152,24 @@ static void control_task(void *arg){
             }
         }
 
+
+
         if (xQueueReceive(web_lecture_queue, &code_updated, portMAX_DELAY)){
+
+            switch (code_updated){
+                case TON_CODE:
+                // TON Updated
+                break;
+
+                case TOFF_CODE:
+                // TOFF Updated
+                break;
+
+                case TEMP_CODE:
+                // Temperature updated
+                break;
+            }
+
             ESP_LOGI(TAG_TASK_READ, "Code updated: %d\n", code_updated);
         }
 
@@ -184,7 +212,7 @@ static void i2c_task_example(void *arg)
         // printf("temp=%f, hum=%f\n", data_recvd->temperature, data_recvd->humidity);
 
         if (!xQueueSend(i2c_lecture_queue, data_recvd, portMAX_DELAY)){
-            ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
+            ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to i2c queue\n");
         }
 
         vTaskDelay(1000 / portTICK_RATE_MS);
@@ -250,77 +278,78 @@ void stop_webserver(httpd_handle_t server){
 /* Extract, validate and resend if ok value to control task */
 bool validate_value(char *data, uint8_t key){
 
-    bool result = false;
+    bool result = true;
     char *piece;
 
     switch (key){
 
         case TON_CODE:
-        // t_on
-        printf("Validating t_on\n");
-        if ((data[2] == '%') && (piece = strstr(data, SEMICOLON_ENCODE)) != NULL){
-            int hh_mm[2];
-            // Extract data from URL
-            hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
-            hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
+            // t_on
+            printf("Validating t_on\n");
+            if ((data[2] == '%') && ((piece = strstr(data, SEMICOLON_ENCODE)) != NULL)){
 
-            // Temporary just for testing
-            if (hh_mm[0] < time_off_global[0]){
+                int hh_mm[2];
+
+                // Extract data from URL
+                hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
+                hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
+
                 time_on_global[0] = hh_mm[0];
                 time_on_global[1] = hh_mm[1];
-                result = true;
-            } else if (hh_mm[0] == time_off_global[0] && hh_mm[1] < time_off_global[1]){
-                time_on_global[0] = hh_mm[0];
-                time_on_global[1] = hh_mm[1];
-                result = true;
-            } else {
-                result = false;
+
+                // TODO validate time is correct
+
+                // If it has been validated, update HTML
+                replace_in_html(HO_pos_global, data, 2);
+                replace_in_html(MO_pos_global, piece+3, 2);
+                // TODO: ##ifdef for debugging
+                printf("Dis HH: %d\n", hh_mm[0]);
+                printf("Dis MM: %d\n", hh_mm[1]);
+
             }
-            // TODO: ##ifdef for debugging
-            printf("Dis HH: %d\n", hh_mm[0]);
-            printf("Dis MM: %d\n", hh_mm[1]);
-
-        }
-        break;
+            break;
 
         case TOFF_CODE:
-        // t_off
-        printf("Validating t_off\n");
-        printf("Dis data starts: %s\n", data);
-        if ((data[2] == '%') && (piece = strstr(data, SEMICOLON_ENCODE)) != NULL){
-            uint8_t hh_mm[2];
-            hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
-            hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
+            // t_off
+            printf("Validating t_off\n");
+            printf("Dis data starts: %s\n", data);
+            if ((data[2] == '%') && (piece = strstr(data, SEMICOLON_ENCODE)) != NULL){
+                uint8_t hh_mm[2];
+                hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
+                hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
 
-            // Temporary just for testing
-            if (hh_mm[0] > time_on_global[0]){
                 time_off_global[0] = hh_mm[0];
                 time_off_global[1] = hh_mm[1];
-                result = true;
-            } else if (hh_mm[0] == time_on_global[0] && hh_mm[1] > time_on_global[1]){
-                time_off_global[0] = hh_mm[0];
-                time_off_global[1] = hh_mm[1];
-                result = true;
-            } else {
-                result = false;
+
+                // TODO validate time is correct
+
+                printf("piece: %s\n", piece);
+
+                // If it has been validated, update HTML
+                replace_in_html(HF_pos_global, data, 2);
+                replace_in_html(MF_pos_global, piece+3, 2);
+
+                printf("Dis HH: %d\n", hh_mm[0]);
+                printf("Dis MM: %d\n", hh_mm[1]);
             }
-            printf("Dis HH: %d\n", hh_mm[0]);
-            printf("Dis MM: %d\n", hh_mm[1]);
-        }
-        break;
+            break;
 
         case TEMP_CODE:
-        // temperature
-        printf("Validating temperature\n");
-        if (atoi(data) > 0){
-            ref_temp_global = atoi(data);
-            result = true;
-        }
-        break;
+            // temperature
+            printf("Validating temperature\n");
+            if (atoi(data) > 0){
+                ref_temp_global = atoi(data);
+                result = true;
+            }
+            // If it has been validated, update HTML
+            if (result){
+                replace_in_html(TC_pos_global, data, 2);
+            }
+            break;
 
         default:
-        result = false;
-        break;
+            result = false;
+            break;
     }
 
     return result;
@@ -333,6 +362,7 @@ esp_err_t control_get_handler(httpd_req_t *req)
 {
     char*  buf;
     size_t buf_len;
+    uint32_t notif = 0;
 
     /* Get header value string length and allocate memory for length + 1,
      * extra byte for null termination if string "Host" found in req */
@@ -363,10 +393,9 @@ esp_err_t control_get_handler(httpd_req_t *req)
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => t_on=%s", param);
                 // Validate data from user
                 if(validate_value(param, TON_CODE)){
-                    // TODO: probably TBD with a task notification
-                    // if (xQueueSend(web_lecture_queue, (void *)TON_CODE, portMAX_DELAY) != pdPASS){
-                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
-                    // }
+                    printf("Antes del *notif = TON_CODE;\n");
+                    notif = (uint32_t)TON_CODE;
+                    printf("después del *notif = TON_CODE;\n");
                 }
 
             }
@@ -375,10 +404,7 @@ esp_err_t control_get_handler(httpd_req_t *req)
             if (httpd_query_key_value(buf, "t_off", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => t_off=%s", param);
                 if(validate_value(param, TOFF_CODE)){
-                    // TODO: probably TBD with a task notification
-                    // if (xQueueSend(web_lecture_queue, (void *)TOFF_CODE, portMAX_DELAY) != pdPASS){
-                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
-                    // }
+                    notif = TOFF_CODE;
                 }
 
             }
@@ -387,10 +413,13 @@ esp_err_t control_get_handler(httpd_req_t *req)
             if (httpd_query_key_value(buf, "temp", param, sizeof(param)) == ESP_OK) {
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => temp=%s", param);
                 if(validate_value(param, TEMP_CODE)){
-                    // TODO: probably TBD with a task notification
-                    // if (xQueueSend(web_lecture_queue, (void *)TEMP_CODE, portMAX_DELAY) != pdPASS){
-                    //     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to queue\n");
-                    // }
+                    notif = TEMP_CODE;
+                }
+            }
+            printf("Antes del notif\n");
+            if (notif > 0){
+                if (!xQueueSend(web_lecture_queue, &notif, portMAX_DELAY)){
+                    ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to web queue\n");
                 }
             }
         }
@@ -403,10 +432,13 @@ esp_err_t control_get_handler(httpd_req_t *req)
     /* Set some custom headers */
     httpd_resp_set_hdr(req, "Custom-Header-1", "Custom-Value-1");
 
+    printf("%s\n", formated_html);
+
 
     /* Send response with custom headers and body set as the
      * string passed in user context*/
-    const char* resp_str = (const char*) req->user_ctx;
+    const char* resp_str = (const char*) formated_html;
+    printf("%s\n", resp_str);
     httpd_resp_send(req, resp_str, strlen(resp_str));
     ESP_LOGI(TAG_SERVER, "Sent response");
 
@@ -436,9 +468,31 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+
+void initial_replacement(){
+
+    HO_pos_global = strstr(formated_html, "HO");
+    MO_pos_global = strstr(formated_html, "MO");
+    HF_pos_global = strstr(formated_html, "HF");
+    MF_pos_global = strstr(formated_html, "MF");
+    TC_pos_global = strstr(formated_html, "TC");
+
+}
+
+void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes){
+
+    uint32_t i;
+
+    for (i = 0; i < num_of_bytes; i++){
+        printf("i:%d\n", i);
+        *(target + i) = *(insertion+i);
+    }
+
+}
+
 /* Main */
-void app_main()
-{
+void app_main(){
+    
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -449,12 +503,14 @@ void app_main()
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
 
+    initial_replacement();
+
     server = start_webserver();
 
     // Create queue to publish temperature sensor's data
     // TODO: remove magic number 10
     i2c_lecture_queue = xQueueCreate(10, sizeof(struct SensorData));
-    web_lecture_queue = xQueueCreate(10, sizeof(uint8_t));
+    web_lecture_queue = xQueueCreate(10, sizeof(uint32_t));
 
     if (gpio_setup() != ESP_OK){
         ESP_LOGI(TAG_MAIN, "Error configuring GPIOs");
