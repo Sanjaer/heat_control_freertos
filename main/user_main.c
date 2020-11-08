@@ -278,7 +278,7 @@ void stop_webserver(httpd_handle_t server){
 /* Extract, validate and resend if ok value to control task */
 bool validate_value(char *data, uint8_t key){
 
-    bool result = true;
+    bool result = false;
     char *piece;
 
     switch (key){
@@ -288,20 +288,27 @@ bool validate_value(char *data, uint8_t key){
             printf("Validating t_on\n");
             if ((data[2] == '%') && ((piece = strstr(data, SEMICOLON_ENCODE)) != NULL)){
 
-                int hh_mm[2];
+                uint8_t hh_mm[2];
 
                 // Extract data from URL
                 hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
                 hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
 
-                time_on_global[0] = hh_mm[0];
-                time_on_global[1] = hh_mm[1];
+                // Verify legal hour
+                if (hh_mm[0] < 24){
+                    // Verify legal minute
+                    if (hh_mm[1] < 60){
+                        // Update global marker
+                        time_on_global[0] = hh_mm[0];
+                        time_on_global[1] = hh_mm[1];
+                        // If it has been validated, update HTML
+                        replace_in_html(HO_pos_global, data, 2);
+                        replace_in_html(MO_pos_global, piece+3, 2);
+                        // Set as valid
+                        result = true;
+                    }
+                }
 
-                // TODO validate time is correct
-
-                // If it has been validated, update HTML
-                replace_in_html(HO_pos_global, data, 2);
-                replace_in_html(MO_pos_global, piece+3, 2);
                 // TODO: ##ifdef for debugging
                 printf("Dis HH: %d\n", hh_mm[0]);
                 printf("Dis MM: %d\n", hh_mm[1]);
@@ -318,17 +325,22 @@ bool validate_value(char *data, uint8_t key){
                 hh_mm[0] = ((data[0] - '0') * 10) + (data[1] - '0');
                 hh_mm[1] = ((piece[3] - '0') * 10) + (piece[4] - '0');
 
-                time_off_global[0] = hh_mm[0];
-                time_off_global[1] = hh_mm[1];
+                // Verify legal hour
+                if (hh_mm[0] < 24){
+                    // Verify legal minute
+                    if (hh_mm[1] < 60){
+                        // Update global marker
+                        time_off_global[0] = hh_mm[0];
+                        time_off_global[1] = hh_mm[1];
+                        // If it has been validated, update HTML
+                        replace_in_html(HF_pos_global, data, 2);
+                        replace_in_html(MF_pos_global, piece+3, 2);
+                        // Set as valid
+                        result = true;
+                    }
+                }  
 
-                // TODO validate time is correct
-
-                printf("piece: %s\n", piece);
-
-                // If it has been validated, update HTML
-                replace_in_html(HF_pos_global, data, 2);
-                replace_in_html(MF_pos_global, piece+3, 2);
-
+                // TODO: ##ifdef for debugging
                 printf("Dis HH: %d\n", hh_mm[0]);
                 printf("Dis MM: %d\n", hh_mm[1]);
             }
