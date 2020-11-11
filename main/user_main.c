@@ -40,12 +40,12 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_sleep.h"
-#include "lwip/apps/sntp.h"
 
 #include <esp_http_server.h>
 #include "driver/gpio.h"
 
 #include "sht3x.h"
+#include "sntp_m.h"
 
 #define GPIO_OUTPUT_IO_1        5
 #define GPIO_OUTPUT_PIN_SEL     ((1ULL<<GPIO_OUTPUT_IO_1))
@@ -63,7 +63,6 @@ static const char *TAG_WIFI = "wifi";
 static const char *TAG_SERVER = "server";
 static const char *TAG_TASK_READ = "ReadQ";
 static const char *TAG_TASK_WRITE = "WriteQ";
-static const char *TAG_SNTP = "sntp";
 static const char *TAG_CTRL = "ctrl";
 
 /* Global consts */
@@ -107,13 +106,11 @@ static char  formated_html[] =  "<h2>Smart heat controller </h2>" \
 /* Task declarations */
 static void control_task(void *arg);
 static void i2c_task_sht30(void *arg);
-static void sntp_task(void *arg);
 
 
 /* Local functions declarations */
 static void sleep_seconds(const uint32_t deep_sleep_sec);
-bool is_time_set (void);
-static void initialize_sntp(void);
+
 esp_err_t gpio_setup(void);
 httpd_handle_t start_webserver(void);
 void stop_webserver(httpd_handle_t server);
@@ -149,6 +146,47 @@ httpd_uri_t control_uri = {
 
 
 /* Task definitions */
+/**
+ * @brief task that inits and keeps sntp
+ */
+static void sntp_task(void *arg) {
+
+    char strftime_buf[64];
+    time_t now;
+    struct tm timeinfo;
+    const int retry_count = 10;
+    uint8_t retry = 0;
+
+    initialize_sntp();
+
+    // time() returns the time since 00:00:00 UTC, January 1, 1970 (Unix timestamp) in seconds. 
+    // If now is not a null pointer, the returned value is also stored in the object pointed to by second.
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+
+    for (;;){
+        uint8_t retry = 0;
+        // tm_year = The number of years since 1900
+        // update 'now' variable with current time
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        // TODO infinite loop <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        while (!is_time_set() && ++retry < retry_count) {
+            ESP_LOGI(TAG_SNTP, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+        }
+
+        strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+        ESP_LOGI(TAG_SNTP, "The current date/time in Madrid is: %s", strftime_buf);
+
+        vTaskDelay(1000 / portTICK_RATE_MS);
+    }
+
+}
+
+/**
+ * @brief task that runs the state machine
+ */
 static void control_task(void *arg){
 
     struct SensorData *data_recvd = malloc(sizeof(struct SensorData));
@@ -158,17 +196,7 @@ static void control_task(void *arg){
     uint32_t time_on, time_off, time_now;
 
     for (;;) {
-
-        time(&now);
-        localtime_r(&now, &timeinfo);
-        
-        // Set as integer to prevent loads of ifs
-        time_on = time_on_global[0]*100 + time_on_global[1];
-        time_off = time_off_global[0]*100 + time_off_global[1];
-        time_now = timeinfo.tm_hour*100 + timeinfo.tm_min;
         printf("STATE:%d\n", state);
-        printf("time_on: %d, time_off: %d, time_now: %d\n", time_on, time_off, time_now);
-
         
         // Main state machine
         switch(state){
@@ -211,6 +239,14 @@ static void control_task(void *arg){
 
             // Check if it is time to be active w/ day between
             case 3:
+                time(&now);
+                localtime_r(&now, &timeinfo);
+                
+                // Set as integer to prevent loads of ifs
+                time_on = time_on_global[0]*100 + time_on_global[1];
+                time_off = time_off_global[0]*100 + time_off_global[1];
+                time_now = timeinfo.tm_hour*100 + timeinfo.tm_min;
+                printf("time_on: %d, time_off: %d, time_now: %d\n", time_on, time_off, time_now);
 
                 if ((time_on >= time_now) && (time_off < time_now)){
                     // We are on time
@@ -299,45 +335,12 @@ static void i2c_task_sht30(void *arg) {
     i2c_driver_delete(I2C_EXAMPLE_MASTER_NUM);
 }
 
-static void sntp_task(void *arg) {
-
-    char strftime_buf[64];
-    time_t now;
-    struct tm timeinfo;
-    const int retry_count = 10;
-    uint8_t retry = 0;
-
-    initialize_sntp();
-
-    // time() returns the time since 00:00:00 UTC, January 1, 1970 (Unix timestamp) in seconds. 
-    // If now is not a null pointer, the returned value is also stored in the object pointed to by second.
-    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
-    tzset();
-
-    for (;;){
-        uint8_t retry = 0;
-        // tm_year = The number of years since 1900
-        // update 'now' variable with current time
-        time(&now);
-        localtime_r(&now, &timeinfo);
-        // TODO infinite loop <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-        while (!is_time_set() && ++retry < retry_count) {
-            ESP_LOGI(TAG_SNTP, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-        }
-
-        strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-        ESP_LOGI(TAG_SNTP, "The current date/time in Madrid is: %s", strftime_buf);
-
-        vTaskDelay(60000 / portTICK_RATE_MS);
-    }
-
-}
 
 
 /* Local functions definitions */
-// Function that sends the ESP8266 to sleep for deep_sleep_sec seconds
-// TB Used or Removed
+/**
+ * @brief Function that sends the ESP8266 to sleep for deep_sleep_sec seconds
+ */
 static void sleep_seconds(const uint32_t deep_sleep_sec) {
     
     ESP_LOGI(TAG_CTRL, "Entering deep sleep for %d seconds", deep_sleep_sec);
@@ -345,37 +348,9 @@ static void sleep_seconds(const uint32_t deep_sleep_sec) {
 
 }
 
-// Function that checks whether the time is set or not
-// TB Used or Removed
-bool is_time_set (void) {
-    bool result = false;
-    time_t now;
-    struct tm timeinfo;
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    // Is time set? If not, tm_year will be (1970 - 1900).
-    if (timeinfo.tm_year < (2020 - 1900)) {
-        ESP_LOGI(TAG_SNTP, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
-    } else{
-        ESP_LOGI(TAG_SNTP, "Time is already set.");
-        result = true;
-    }
-
-    return result;
-}
-
-// Function to initialize SNTP, to be called only once
-static void initialize_sntp(void) {
-
-    ESP_LOGI(TAG_SNTP, "Initializing SNTP");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
-
-}
-
-// Function to configure GPIOs
+/**
+ * @brief Function to configure GPIOs
+ */
 esp_err_t gpio_setup(void){
 
     esp_err_t result;
@@ -398,7 +373,9 @@ esp_err_t gpio_setup(void){
 
 }
 
-
+/**
+ * @brief Function to start webserver
+ */
 httpd_handle_t start_webserver(void){
 
     httpd_handle_t server = NULL;
@@ -418,7 +395,9 @@ httpd_handle_t start_webserver(void){
     return NULL;
 }
 
-
+/**
+ * @brief Function to stop webserver
+ */
 void stop_webserver(httpd_handle_t server){
 
     // Stop the httpd server
@@ -427,7 +406,9 @@ void stop_webserver(httpd_handle_t server){
 }
 
 
-/* Extract, validate and resend if ok value to control task */
+/**
+ * @brief Function that extracts, validates and resends if ok value to control task
+ */
 bool validate_value(char *data, uint8_t key){
 
     bool result = false;
@@ -520,7 +501,9 @@ bool validate_value(char *data, uint8_t key){
 
 }
 
-// Function that maps the HTML for later replacement of Key fields
+/**
+ * @brief Function that maps the HTML for later replacement of Key fields
+ */
 void initial_mapping(){
 
     HO_pos_global = strstr(formated_html, "HO");
@@ -531,6 +514,9 @@ void initial_mapping(){
 
 }
 
+/**
+ * @brief Function that replaces the number of chars given grom target with insertion
+ */
 void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes){
 
     for (uint32_t i = 0; i < num_of_bytes; i++){
@@ -658,22 +644,24 @@ void app_main(){
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
 
+    // Map HTML
     initial_mapping();
 
+    // Starts webserver
     server = start_webserver();
 
     // Create queue to publish temperature sensor's data
-    // TODO: remove magic number 10
     i2c_lecture_queue = xQueueCreate(10, sizeof(struct SensorData));
     web_lecture_queue = xQueueCreate(10, sizeof(uint32_t));
 
+    // Configure gpios and launch tasks
     if (gpio_setup() != ESP_OK){
         ESP_LOGI(TAG_MAIN, "Error configuring GPIOs");
     } else {
         ESP_LOGI(TAG_MAIN, "Starting tasks");
-        // Task to control the relay
-        xTaskCreate(control_task, "control_task", 1024, NULL, 10, NULL);
         // Task to control SHT30 sensor
         xTaskCreate(i2c_task_sht30, "i2c_task_sht30", 2048, NULL, 10, NULL);
+        // Task to control the relay
+        xTaskCreate(control_task, "control_task", 1024, NULL, 10, NULL);
     }
 }
