@@ -55,6 +55,7 @@
 #define TOFF_CODE               (uint8_t)2
 #define TEMP_CODE               (uint8_t)3
 #define DATA_FIELD_SIZE         2
+#define TEMP_HYSTERESIS         1
 
 /* Tags for logs */
 static const char *TAG_MAIN = "main";
@@ -84,7 +85,7 @@ static char* TC_pos_global = 0;
 static uint8_t time_on_global[] = {0,0};
 static uint8_t time_off_global[] = {23,59};
 static uint8_t ref_temp_global = 18;
-static char  formated_html[] =   "<h2>Smart heat controller </h2>" \
+static char  formated_html[] =  "<h2>Smart heat controller </h2>" \
                                 "<form action=\"/control\"> \
                                 Time ON: <input type=\"text\" name=\"t_on\"> \
                                 <input type=\"submit\" value=\"Submit\"> \
@@ -106,7 +107,7 @@ static char  formated_html[] =   "<h2>Smart heat controller </h2>" \
 /* Task declarations */
 static void control_task(void *arg);
 static void i2c_task_sht30(void *arg);
-static void sntp_example_task(void *arg);
+static void sntp_task(void *arg);
 
 
 /* Local functions declarations */
@@ -151,42 +152,106 @@ httpd_uri_t control_uri = {
 static void control_task(void *arg){
 
     struct SensorData *data_recvd = malloc(sizeof(struct SensorData));
-    uint8_t code_updated=0;
+    uint8_t state=0;
+    time_t now;
+    struct tm timeinfo;
+    uint32_t time_on, time_off, time_now;
 
     for (;;) {
-        memset(data_recvd, 0, sizeof(struct SensorData));
 
-        if (xQueueReceive(i2c_lecture_queue, data_recvd, portMAX_DELAY)) {
-            // ESP_LOGI(TAG_TASK_READ, "Temperature from queue: %f\n", data_recvd->temperature);
-            if (data_recvd->temperature < ref_temp_global){
-                gpio_set_level(GPIO_OUTPUT_IO_1, 1);
-            } else {
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        
+        // Set as integer to prevent loads of ifs
+        time_on = time_on_global[0]*100 + time_on_global[1];
+        time_off = time_off_global[0]*100 + time_off_global[1];
+        time_now = timeinfo.tm_hour*100 + timeinfo.tm_min;
+        printf("STATE:%d\n", state);
+        printf("time_on: %d, time_off: %d, time_now: %d\n", time_on, time_off, time_now);
+
+        
+        // Main state machine
+        switch(state){
+
+            // Check if hours active change day (pass 00:00AM)
+            case 1:
+                time_on = time_on_global[0]*100 + time_on_global[1];
+                time_off = time_off_global[0]*100 + time_off_global[1];
+                printf("time_on: %d, time_off: %d, time_now: %d\n", time_on, time_off, time_now);
+
+                if (time_on < time_off){
+                    // It doesn't
+                    state = 2;
+                } else {
+                    // It does change day
+                    state = 3;
+                }
+                break;
+
+            // Check if it is time to be active no day between
+            case 2:
+                time(&now);
+                localtime_r(&now, &timeinfo);
+
+                // Set as integer to prevent loads of ifs
+                time_on = time_on_global[0]*100 + time_on_global[1];
+                time_off = time_off_global[0]*100 + time_off_global[1];
+                time_now = timeinfo.tm_hour*100 + timeinfo.tm_min;
+
+                printf("time_on: %d, time_off: %d, time_now: %d\n", time_on, time_off, time_now);
+
+                if ((time_on <= time_now) && (time_off > time_now)){
+                    // We are on time
+                    state = 4;
+                } else{
+                    // No time to be on
+                    state = 5;
+                }
+                break;
+
+            // Check if it is time to be active w/ day between
+            case 3:
+
+                if ((time_on >= time_now) && (time_off < time_now)){
+                    // We are on time
+                    state = 4;
+                } else{
+                    // No time to be on
+                    state = 5;
+                }
+                break;
+
+            // Check if the temperature is low
+            // If so, start heating
+            case 4:
+                if (data_recvd->temperature < ref_temp_global+TEMP_HYSTERESIS){
+                    // Heat
+                    gpio_set_level(GPIO_OUTPUT_IO_1, 1);                
+                    state = 0;
+                } else {
+                    // send to stop heating
+                    state = 5;
+                }
+                break;
+
+            case 5:
                 gpio_set_level(GPIO_OUTPUT_IO_1, 0);
-            }
+                state = 0;
+                break;
+
+            default:
+                memset(data_recvd, 0, sizeof(struct SensorData));
+
+                if (xQueueReceive(i2c_lecture_queue, data_recvd, portMAX_DELAY)) {
+                    ESP_LOGI(TAG_TASK_READ, "Temperature from queue: %f\n", data_recvd->temperature);
+                }
+                // TODO: update current temperature html
+                state = 1;
+                break;
+
         }
 
-
-
-        if (xQueueReceive(web_lecture_queue, &code_updated, portMAX_DELAY)){
-
-            switch (code_updated){
-                case TON_CODE:
-                // TON Updated
-                break;
-
-                case TOFF_CODE:
-                // TOFF Updated
-                break;
-
-                case TEMP_CODE:
-                // Temperature updated
-                break;
-            }
-
-            ESP_LOGI(TAG_TASK_READ, "Code updated: %d\n", code_updated);
-        }
-
-        vTaskDelay(2000 / portTICK_RATE_MS);
+        vTaskDelay(1000 / portTICK_RATE_MS);
     }
 }
 
@@ -234,12 +299,13 @@ static void i2c_task_sht30(void *arg) {
     i2c_driver_delete(I2C_EXAMPLE_MASTER_NUM);
 }
 
-static void sntp_example_task(void *arg) {
+static void sntp_task(void *arg) {
 
     char strftime_buf[64];
     time_t now;
     struct tm timeinfo;
     const int retry_count = 10;
+    uint8_t retry = 0;
 
     initialize_sntp();
 
@@ -249,10 +315,16 @@ static void sntp_example_task(void *arg) {
     tzset();
 
     for (;;){
+        uint8_t retry = 0;
         // tm_year = The number of years since 1900
         // update 'now' variable with current time
         time(&now);
         localtime_r(&now, &timeinfo);
+        // TODO infinite loop <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        while (!is_time_set() && ++retry < retry_count) {
+            ESP_LOGI(TAG_SNTP, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+        }
 
         strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
         ESP_LOGI(TAG_SNTP, "The current date/time in Madrid is: %s", strftime_buf);
@@ -284,8 +356,6 @@ bool is_time_set (void) {
     localtime_r(&now, &timeinfo);
     // Is time set? If not, tm_year will be (1970 - 1900).
     if (timeinfo.tm_year < (2020 - 1900)) {
-
-        printf("TIME --> %d:%d\n", timeinfo.tm_hour, timeinfo.tm_min);
         ESP_LOGI(TAG_SNTP, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
     } else{
         ESP_LOGI(TAG_SNTP, "Time is already set.");
@@ -327,7 +397,6 @@ esp_err_t gpio_setup(void){
     return result;
 
 }
-
 
 
 httpd_handle_t start_webserver(void){
@@ -451,6 +520,7 @@ bool validate_value(char *data, uint8_t key){
 
 }
 
+// Function that maps the HTML for later replacement of Key fields
 void initial_mapping(){
 
     HO_pos_global = strstr(formated_html, "HO");
@@ -463,10 +533,7 @@ void initial_mapping(){
 
 void replace_in_html(char* target, char* insertion, uint32_t num_of_bytes){
 
-    uint32_t i;
-
-    for (i = 0; i < num_of_bytes; i++){
-        printf("i:%d\n", i);
+    for (uint32_t i = 0; i < num_of_bytes; i++){
         *(target + i) = *(insertion+i);
     }
 
@@ -509,9 +576,7 @@ esp_err_t control_get_handler(httpd_req_t *req)
                 ESP_LOGI(TAG_SERVER, "Found URL query parameter => t_on=%s", param);
                 // Validate data from user
                 if(validate_value(param, TON_CODE)){
-                    printf("Antes del *notif = TON_CODE;\n");
                     notif = (uint32_t)TON_CODE;
-                    printf("después del *notif = TON_CODE;\n");
                 }
 
             }
@@ -532,7 +597,6 @@ esp_err_t control_get_handler(httpd_req_t *req)
                     notif = TEMP_CODE;
                 }
             }
-            printf("Antes del notif\n");
             if (notif > 0){
                 if (!xQueueSend(web_lecture_queue, &notif, portMAX_DELAY)){
                     ESP_LOGI(TAG_TASK_WRITE, "ERROR Writing to web queue\n");
@@ -548,13 +612,9 @@ esp_err_t control_get_handler(httpd_req_t *req)
     /* Set some custom headers */
     httpd_resp_set_hdr(req, "Custom-Header-1", "Custom-Value-1");
 
-    printf("%s\n", formated_html);
-
-
     /* Send response with custom headers and body set as the
      * string passed in user context*/
     const char* resp_str = (const char*) formated_html;
-    printf("%s\n", resp_str);
     httpd_resp_send(req, resp_str, strlen(resp_str));
     ESP_LOGI(TAG_SERVER, "Sent response");
 
@@ -593,7 +653,7 @@ void app_main(){
 
     ESP_ERROR_CHECK(example_connect());
 
-    xTaskCreate(sntp_example_task, "sntp_example_task", 2048, NULL, 10, NULL);
+    xTaskCreate(sntp_task, "sntp_task", 2048, NULL, 10, NULL);
 
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
